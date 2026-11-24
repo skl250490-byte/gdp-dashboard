@@ -25,6 +25,8 @@ WET_SNOW_ALBEDO = 0.60
 MIN_WIND_MS = 0.5          # floor so turbulent fluxes never vanish in calm air
 SNOW_FALL_SPEED = 1.0      # m/s, wet snowflakes
 WET_WINDOW = (-0.5, 1.5)   # wet-bulb range (°C) where snow is wet and sticky
+PACK_DENSITY = 250.0       # kg/m3, settled wet snowpack
+DEFAULT_LAPSE = 6.0        # °C/km
 
 
 # ------------------------------------------------------------------ physics
@@ -145,6 +147,8 @@ def compute_physics(df, cliff, leaf_drop, t50, scale, lapse, diam_m, ch):
     df["Snow_Level_m"] = np.round(SUMMIT_ELEV_M + (tw - t50) / lapse * 1000.0, 0)
     df["Freezing_Level_m"] = np.round(SUMMIT_ELEV_M + t_crest / lapse * 1000.0, 0)
     df["Summit_Elev_m"] = SUMMIT_ELEV_M
+    # depth of above-freezing air that falling flakes cross while partly melting
+    df["Melt_Layer_Depth_m"] = np.round(df["Freezing_Level_m"] - df["Snow_Level_m"], 0)
 
     # --- surface energy balance of a melting (0 °C) snow surface, W/m2
     t_k = t_crest + 273.15
@@ -168,7 +172,19 @@ def compute_physics(df, cliff, leaf_drop, t50, scale, lapse, diam_m, ch):
     df["SW_Abs_W"] = np.round(sw_abs, 1)
     df["Rain_Heat_W"] = np.round(q_rain, 1)
     df["Q_Net_W"] = np.round(q_net, 1)
-    df["Melt_mm_h"] = np.round(np.maximum(q_net, 0.0) * 3600.0 / LF, 3)
+    melt = np.maximum(q_net, 0.0) * 3600.0 / LF
+    df["Melt_mm_h"] = np.round(melt, 3)
+    df["Refreeze_Capacity_mm_h"] = np.round(np.maximum(-q_net, 0.0) * 3600.0 / LF, 3)
+
+    # --- snowpack mass balance over the window: SWE(t) = max(SWE(t-1) + snow - melt, 0)
+    snow_we = precip * p_snow                                          # mm w.e. per hour
+    swe = np.zeros(len(df))
+    pack = 0.0
+    for i in range(len(df)):
+        pack = max(pack + snow_we[i] - melt[i], 0.0)
+        swe[i] = pack
+    df["Snowpack_SWE_mm"] = np.round(swe, 2)
+    df["Snowpack_Depth_cm"] = np.round(swe / PACK_DENSITY * 100.0, 2)
 
     # --- wet-snow accretion on a cylinder (ISO 12494-style)
     wet_window = (tw >= WET_WINDOW[0]) & (tw <= WET_WINDOW[1])
@@ -257,7 +273,7 @@ def fetch_daily_history(first_year, last_year):
         "elevation": SUMMIT_ELEV_M,
         "start_date": f"{first_year - 1}-12-01",
         "end_date": end,
-        "daily": "temperature_2m_mean,precipitation_sum",
+        "daily": "temperature_2m_mean,temperature_2m_min,precipitation_sum",
         "timezone": "Asia/Dhaka",
     }
     last_err = ""
@@ -312,6 +328,33 @@ def find_extremes(daily, window=7):
     }
 
 
+def find_wet_snow_days(daily, top_n=10, min_precip=1.0, cold_pct=25, lapse=DEFAULT_LAPSE):
+    """Rank winter days where it rains, it is very cold, and the freezing level
+    sits closest to the summit.
+
+    Filters: Dec-Feb, precipitation >= min_precip mm, daily-mean temperature in the
+    coldest `cold_pct` percent of winter days. Rank: |freezing level - summit| ascending
+    (freezing level from daily minimum temperature and the lapse rate), wetter first on ties.
+    """
+    d = pd.DataFrame({
+        "date": pd.to_datetime(daily["time"]),
+        "tmin": pd.to_numeric(pd.Series(daily["temperature_2m_min"]), errors="coerce"),
+        "tmean": pd.to_numeric(pd.Series(daily["temperature_2m_mean"]), errors="coerce"),
+        "precip": pd.to_numeric(pd.Series(daily["precipitation_sum"]), errors="coerce"),
+    }).set_index("date").sort_index()
+    w = d[d.index.month.isin([12, 1, 2])].dropna()
+    thr = w["tmean"].quantile(cold_pct / 100.0)
+    cand = w[(w["precip"] >= min_precip) & (w["tmean"] <= thr)].copy()
+    cand["Above_Summit_m"] = cand["tmin"] / lapse * 1000.0
+    cand["Freezing_Level_m"] = SUMMIT_ELEV_M + cand["Above_Summit_m"]
+    cand["abs_gap"] = cand["Above_Summit_m"].abs()
+    cand = cand.sort_values(["abs_gap", "precip"], ascending=[True, False]).head(top_n)
+    out = cand.reset_index()
+    out["Date"] = out["date"].dt.strftime("%Y-%m-%d")
+    out = out.rename(columns={"tmin": "Tmin_C", "tmean": "Tmean_C", "precip": "Precip_mm"})
+    return out[["Date", "Tmin_C", "Tmean_C", "Precip_mm", "Freezing_Level_m", "Above_Summit_m"]].round(1)
+
+
 def last_complete_winter_year():
     today = pd.Timestamp.today()
     return today.year if (today.month, today.day) >= (3, 10) else today.year - 1
@@ -350,7 +393,9 @@ st.divider()
 st.sidebar.header("1. Winter Season Selection")
 AUTO_RAIN = "Auto: Rainiest Winter on Record (ERA5 1991-present)"
 AUTO_COLD = "Auto: Coldest 7-Day Cold Wave on Record (ERA5 1991-present)"
+AUTO_WET = "Auto: Wet-Snow Setup Days (freezing layer at summit + rain + very cold)"
 season_map = {
+    AUTO_WET: ("auto", "auto"),
     AUTO_RAIN: ("auto", "auto"),
     AUTO_COLD: ("auto", "auto"),
     "Winter 2017-2018 (Record 2.9°C Cold Wave)": ("2017-12-01", "2018-02-28"),
@@ -362,6 +407,7 @@ season_map = {
 }
 
 selected_season = st.sidebar.selectbox("Choose Winter Season:", list(season_map.keys()))
+wet_table = None
 
 if selected_season == "Custom Date Range":
     start_d = st.sidebar.date_input("Start Date", pd.to_datetime("2018-01-01").date())
@@ -370,6 +416,26 @@ if selected_season == "Custom Date Range":
         st.error("Start date must be on or before the end date.")
         st.stop()
     start_d, end_d = start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
+elif selected_season == AUTO_WET:
+    with st.spinner("Scanning the ERA5 winter record for wet-snow setups..."):
+        try:
+            wet_table = find_wet_snow_days(fetch_daily_history(1991, last_complete_winter_year()))
+        except Exception as e:
+            st.error(f"Could not scan the historical record ({e}). Pick another season or try again.")
+            st.stop()
+    if wet_table.empty:
+        st.error("No rainy, very cold winter days were found in the record.")
+        st.stop()
+    rank = st.sidebar.selectbox("Candidate day (1 = closest freezing layer):", list(range(1, len(wet_table) + 1)))
+    pick = wet_table.iloc[rank - 1]
+    day = pd.Timestamp(pick["Date"])
+    start_d = (day - pd.Timedelta(days=3)).strftime("%Y-%m-%d")
+    end_d = (day + pd.Timedelta(days=3)).strftime("%Y-%m-%d")
+    st.sidebar.caption(
+        f"Centered on {pick['Date']}: Tmin {pick['Tmin_C']:.1f} °C, {pick['Precip_mm']:.1f} mm rain, "
+        f"freezing level ≈ {pick['Freezing_Level_m']:.0f} m ({pick['Above_Summit_m']:+.0f} m vs summit). "
+        "Window shows 3 days either side."
+    )
 elif selected_season in (AUTO_RAIN, AUTO_COLD):
     with st.spinner("Scanning the ERA5 winter record for extremes..."):
         try:
@@ -412,6 +478,15 @@ with st.spinner("Syncing 1,063m summit telemetry..."):
 
 st.caption(status_msg)
 
+if wet_table is not None:
+    st.subheader("Top Wet-Snow Setup Days on Record")
+    st.caption(
+        "Winter days with at least 1 mm of rain, daily-mean temperature in the coldest 25% of winter days, "
+        f"ranked by how close the freezing level (daily minimum temperature, {DEFAULT_LAPSE:.0f} °C/km) "
+        "sits to the 1,063 m summit."
+    )
+    st.dataframe(wet_table, use_container_width=True)
+
 df = build_dataframe(raw["hourly"])
 if df.empty:
     st.warning("No data returned for the selected period.")
@@ -434,6 +509,12 @@ col6.metric("Derived Snowfall Total", f"{df['Snowfall_Derived_cm'].sum():.1f} cm
 col7.metric("Lowest Snow Level", f"{df['Snow_Level_m'].min():.0f} m")
 col8.metric("Peak Wet-Snow Accretion", f"{df['Accretion_kg_m_h'].max():.3f} kg/m/h")
 
+col9, col10, col11, col12 = st.columns(4)
+col9.metric("Peak Snowpack Depth", f"{df['Snowpack_Depth_cm'].max():.1f} cm")
+col10.metric("Deepest Melt Layer", f"{df['Melt_Layer_Depth_m'].max():.0f} m")
+col11.metric("Peak Melt Rate", f"{df['Melt_mm_h'].max():.2f} mm/h")
+col12.metric("Lowest Freezing Level", f"{df['Freezing_Level_m'].min():.0f} m")
+
 if not snow_hours.any():
     st.info(
         "No hour in this window combined precipitation with a wet-bulb temperature low enough "
@@ -450,7 +531,8 @@ st.subheader(f"Hourly Summit Physics Ledger ({len(view_df)} Matching Hours)")
 display_cols = [
     "Timestamp", "Air_Temp_1063m_C", "Crest_Wet_Bulb_C", "Leaf_Surface_Temp_C",
     "RH_pct", "Precip_mm", "Snow_Prob", "SLR", "Snowfall_Derived_cm", "Snow_Level_m",
-    "Melt_mm_h", "Accretion_kg_m_h", "Wind_kmh", "Airmass_Origin", "Summit_Verdict",
+    "Freezing_Level_m", "Melt_Layer_Depth_m", "Melt_mm_h", "Snowpack_Depth_cm",
+    "Accretion_kg_m_h", "Wind_kmh", "Airmass_Origin", "Summit_Verdict",
 ]
 st.dataframe(view_df[display_cols], use_container_width=True)
 
@@ -496,6 +578,17 @@ with st.expander("Physics reference: laws used for wet snow"):
 **8. Wet-snow accretion on a cylinder (ISO 12494 form)**
 `dM/dt = α₁ · α₂ · w · V · D`, with `w = P / v_fall`, `V = √(u² + v_fall²)`, `α₂ = min(1, 1/u)`.
 Stickiness is full when Tw is between −0.5 and +1.5 °C (liquid-water film bonds flakes), and near zero for rain.
+
+**9. Melting-layer depth**
+`D = z_0°C − z_snow = (T − Tw + T50) / Γ`. The thickness of above-freezing air a falling flake crosses while partly melting.
+A thin layer means snow reaches the summit wet; a thick one means it arrives as rain.
+
+**10. Snowpack mass balance and refreeze**
+`SWE(t) = max(SWE(t−1) + P·P(snow) − M, 0)`, depth `= SWE / ρ_pack` (ρ_pack ≈ 250 kg/m³ for wet settled snow).
+When `Q < 0` the surface has refreeze capacity `−Q · 3600 / L_f` mm/h, which is how a wet pack ripens and then glazes over.
+
+**11. Wet-snow setup day finder**
+Winter days with ≥ 1 mm rain and daily-mean temperature in the coldest 25%, ranked by `|z_0°C − z_summit|`, with `z_0°C` from the daily minimum temperature and the lapse rate.
 
 *Coefficients (T50, density fit, C_H, albedo, accretion window) are empirical approximations, not exact constants.*
         """
