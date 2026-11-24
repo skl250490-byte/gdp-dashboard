@@ -1,4 +1,5 @@
 import time
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,7 @@ LAT = 21.7865
 LON = 92.6101
 SUMMIT_ELEV_M = 1063.0
 API_URL = "https://archive-api.open-meteo.com/v1/archive"
+ARCHIVE_START_YEAR = 1940   # ERA5 reanalysis begins here; nothing earlier exists in this archive
 
 # ---------------------------------------------------------------- constants
 SIGMA = 5.670374e-8        # Stefan-Boltzmann, W m-2 K-4
@@ -355,6 +357,31 @@ def find_wet_snow_days(daily, top_n=10, min_precip=1.0, cold_pct=25, lapse=DEFAU
     return out[["Date", "Tmin_C", "Tmean_C", "Precip_mm", "Freezing_Level_m", "Above_Summit_m"]].round(1)
 
 
+def winter_summary(daily, lapse=DEFAULT_LAPSE):
+    """One row per complete Dec-Feb winter in the record."""
+    d = pd.DataFrame({
+        "date": pd.to_datetime(daily["time"]),
+        "tmin": pd.to_numeric(pd.Series(daily["temperature_2m_min"]), errors="coerce"),
+        "tmean": pd.to_numeric(pd.Series(daily["temperature_2m_mean"]), errors="coerce"),
+        "precip": pd.to_numeric(pd.Series(daily["precipitation_sum"]), errors="coerce"),
+    }).set_index("date").sort_index()
+    w = d[d.index.month.isin([12, 1, 2])].dropna().copy()
+    w["wyear"] = w.index.year + (w.index.month == 12).astype(int)
+    thr = w["tmean"].quantile(0.25)
+    w["rainy_cold"] = (w["precip"] >= 1.0) & (w["tmean"] <= thr)
+    g = w.groupby("wyear")
+    out = pd.DataFrame({
+        "Days": g.size(),
+        "Coldest_Tmin_C": g["tmin"].min().round(1),
+        "Lowest_Freezing_Level_m": (SUMMIT_ELEV_M + g["tmin"].min() / lapse * 1000.0).round(0),
+        "Winter_Rain_mm": g["precip"].sum().round(0),
+        "Rainy_Cold_Days": g["rainy_cold"].sum().astype(int),
+    })
+    out = out[out["Days"] >= 85].drop(columns="Days")
+    out.insert(0, "Winter", [f"{y - 1}-{str(y)[2:]}" for y in out.index])
+    return out.sort_index(ascending=False).reset_index(drop=True)
+
+
 def last_complete_winter_year():
     today = pd.Timestamp.today()
     return today.year if (today.month, today.day) >= (3, 10) else today.year - 1
@@ -393,8 +420,10 @@ st.divider()
 st.sidebar.header("1. Winter Season Selection")
 AUTO_RAIN = "Auto: Rainiest Winter on Record (ERA5 1991-present)"
 AUTO_COLD = "Auto: Coldest 7-Day Cold Wave on Record (ERA5 1991-present)"
+PICK_DAY = "Pick Any Year & Day (1940-present)"
 AUTO_WET = "Auto: Wet-Snow Setup Days (freezing layer at summit + rain + very cold)"
 season_map = {
+    PICK_DAY: ("pick", "pick"),
     AUTO_WET: ("auto", "auto"),
     AUTO_RAIN: ("auto", "auto"),
     AUTO_COLD: ("auto", "auto"),
@@ -408,6 +437,8 @@ season_map = {
 
 selected_season = st.sidebar.selectbox("Choose Winter Season:", list(season_map.keys()))
 wet_table = None
+winter_table = None
+picked_day = None
 
 if selected_season == "Custom Date Range":
     start_d = st.sidebar.date_input("Start Date", pd.to_datetime("2018-01-01").date())
@@ -416,6 +447,31 @@ if selected_season == "Custom Date Range":
         st.error("Start date must be on or before the end date.")
         st.stop()
     start_d, end_d = start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
+elif selected_season == PICK_DAY:
+    today = pd.Timestamp.today()
+    latest = (today - pd.Timedelta(days=6)).date()      # archive trails real time by a few days
+    years = list(range(today.year, ARCHIVE_START_YEAR - 1, -1))
+    year = st.sidebar.selectbox(f"Year ({ARCHIVE_START_YEAR} to {today.year}):", years)
+    lo, hi = date(year, 1, 1), min(date(year, 12, 31), latest)
+    if lo > hi:
+        st.error("That year has no archived data yet. Pick an earlier year.")
+        st.stop()
+    default_day = min(max(date(year, 1, 15), lo), hi)
+    picked = st.sidebar.date_input(
+        "Day it snowed:", default_day, min_value=lo, max_value=hi, key=f"snow_day_{year}"
+    )
+    spread = st.sidebar.slider("Days shown either side", 0, 7, 3)
+    picked_day = pd.Timestamp(picked)
+    start_d = max(picked - timedelta(days=spread), date(ARCHIVE_START_YEAR, 1, 1)).strftime("%Y-%m-%d")
+    end_d = min(picked + timedelta(days=spread), latest).strftime("%Y-%m-%d")
+    st.sidebar.caption(
+        "ERA5 reanalysis starts in 1940, so 1900-1939 is not available. The app tests whether "
+        "the physics supports snow on the day you pick."
+    )
+    try:
+        winter_table = winter_summary(fetch_daily_history(ARCHIVE_START_YEAR + 1, last_complete_winter_year()))
+    except Exception:
+        winter_table = None
 elif selected_season == AUTO_WET:
     with st.spinner("Scanning the ERA5 winter record for wet-snow setups..."):
         try:
@@ -478,6 +534,16 @@ with st.spinner("Syncing 1,063m summit telemetry..."):
 
 st.caption(status_msg)
 
+if winter_table is not None:
+    st.subheader(f"Every Winter on Record ({len(winter_table)} winters, 1940-41 onward)")
+    st.caption(
+        "Click a column header to sort. Lowest_Freezing_Level_m is the coldest day's freezing level "
+        f"({DEFAULT_LAPSE:.0f} °C/km); Rainy_Cold_Days counts days with 1 mm+ rain in the coldest 25% of winter days."
+    )
+    st.dataframe(winter_table, use_container_width=True, height=300)
+elif selected_season == PICK_DAY:
+    st.caption("The winter-by-winter table could not be loaded, but you can still pick a day.")
+
 if wet_table is not None:
     st.subheader("Top Wet-Snow Setup Days on Record")
     st.caption(
@@ -515,7 +581,26 @@ col10.metric("Deepest Melt Layer", f"{df['Melt_Layer_Depth_m'].max():.0f} m")
 col11.metric("Peak Melt Rate", f"{df['Melt_mm_h'].max():.2f} mm/h")
 col12.metric("Lowest Freezing Level", f"{df['Freezing_Level_m'].min():.0f} m")
 
-if not snow_hours.any():
+if picked_day is not None:
+    day_rows = df[df["Timestamp"].dt.normalize() == picked_day]
+    day_snow = day_rows[(day_rows["Precip_mm"] > 0) & (day_rows["Snow_Prob"] >= 0.5)]
+    label = picked_day.strftime("%d %b %Y")
+    if day_rows.empty:
+        st.warning(f"No data came back for {label}.")
+    elif not day_snow.empty:
+        st.success(
+            f"The physics supports snow at the summit on {label}: {len(day_snow)} snow-capable hour(s), "
+            f"derived snowfall {day_rows['Snowfall_Derived_cm'].sum():.1f} cm, "
+            f"lowest snow level {day_rows['Snow_Level_m'].min():.0f} m."
+        )
+    else:
+        low = day_rows["Snow_Level_m"].min()
+        st.info(
+            f"On {label} the model shows no snow at the summit. Lowest snow level was {low:.0f} m "
+            f"({low - SUMMIT_ELEV_M:+.0f} m relative to the summit), minimum crest wet-bulb "
+            f"{day_rows['Crest_Wet_Bulb_C'].min():.1f} °C, rain {day_rows['Precip_mm'].sum():.1f} mm."
+        )
+elif not snow_hours.any():
     st.info(
         "No hour in this window combined precipitation with a wet-bulb temperature low enough "
         "for snow at the summit. That is the physically expected result for most seasons here."
