@@ -247,6 +247,76 @@ def load_data(start_date, end_date):
         )
 
 
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def fetch_daily_history(first_year, last_year):
+    """Daily ERA5 record (Dec of first_year-1 through Feb of last_year). Raises on failure."""
+    end = (pd.Timestamp(last_year, 3, 1) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    params = {
+        "latitude": LAT,
+        "longitude": LON,
+        "elevation": SUMMIT_ELEV_M,
+        "start_date": f"{first_year - 1}-12-01",
+        "end_date": end,
+        "daily": "temperature_2m_mean,precipitation_sum",
+        "timezone": "Asia/Dhaka",
+    }
+    last_err = ""
+    for _ in range(3):
+        try:
+            response = requests.get(API_URL, params=params, timeout=60)
+            if response.status_code == 200:
+                data = response.json()
+                if "daily" in data:
+                    return data["daily"]
+            last_err = f"HTTP {response.status_code}: {response.text[:150]}"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(1.5)
+    raise RuntimeError(last_err)
+
+
+def find_extremes(daily, window=7):
+    """Find the rainiest Dec-Feb winter and the coldest `window`-day spell in the record."""
+    d = pd.DataFrame({
+        "date": pd.to_datetime(daily["time"]),
+        "tmean": pd.to_numeric(pd.Series(daily["temperature_2m_mean"]), errors="coerce"),
+        "precip": pd.to_numeric(pd.Series(daily["precipitation_sum"]), errors="coerce"),
+    }).set_index("date").sort_index()
+
+    in_winter = d.index.month.isin([12, 1, 2])
+    d["wyear"] = d.index.year + (d.index.month == 12).astype(int)
+    w = d[in_winter]
+
+    # rainiest complete winter (skip partial winters at the ends of the record)
+    totals = w.groupby("wyear")["precip"].sum(min_count=1)
+    counts = w.groupby("wyear")["precip"].count()
+    totals = totals[counts >= 85].dropna()
+    rain_year = int(totals.idxmax())
+
+    # coldest rolling window fully inside a winter
+    roll = d["tmean"].rolling(window).mean()
+    starts = roll.index - pd.Timedelta(days=window - 1)
+    mask = in_winter & starts.month.isin([12, 1, 2]) & roll.notna().to_numpy()
+    cold_end = roll[mask].idxmin()
+    cold_start = cold_end - pd.Timedelta(days=window - 1)
+
+    return {
+        "rain_year": rain_year,
+        "rain_total_mm": float(totals.loc[rain_year]),
+        "rain_start": f"{rain_year - 1}-12-01",
+        "rain_end": (pd.Timestamp(rain_year, 3, 1) - pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+        "cold_start": cold_start.strftime("%Y-%m-%d"),
+        "cold_end": cold_end.strftime("%Y-%m-%d"),
+        "cold_mean_c": float(roll.loc[cold_end]),
+        "n_winters": int(len(totals)),
+    }
+
+
+def last_complete_winter_year():
+    today = pd.Timestamp.today()
+    return today.year if (today.month, today.day) >= (3, 10) else today.year - 1
+
+
 def build_dataframe(hourly):
     n = len(hourly["time"])
 
@@ -278,7 +348,11 @@ st.markdown("**Hindu Kush Himalaya Outpost (`21.78°N, 92.61°E`)** — ERA5 sum
 st.divider()
 
 st.sidebar.header("1. Winter Season Selection")
+AUTO_RAIN = "Auto: Rainiest Winter on Record (ERA5 1991-present)"
+AUTO_COLD = "Auto: Coldest 7-Day Cold Wave on Record (ERA5 1991-present)"
 season_map = {
+    AUTO_RAIN: ("auto", "auto"),
+    AUTO_COLD: ("auto", "auto"),
     "Winter 2017-2018 (Record 2.9°C Cold Wave)": ("2017-12-01", "2018-02-28"),
     "Winter 2012-2013 (Historic Jan 2013 Surge)": ("2012-12-01", "2013-02-28"),
     "Winter 2010-2011 (Coldest Drizzle Event)": ("2010-12-01", "2011-02-28"),
@@ -296,6 +370,25 @@ if selected_season == "Custom Date Range":
         st.error("Start date must be on or before the end date.")
         st.stop()
     start_d, end_d = start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
+elif selected_season in (AUTO_RAIN, AUTO_COLD):
+    with st.spinner("Scanning the ERA5 winter record for extremes..."):
+        try:
+            ext = find_extremes(fetch_daily_history(1991, last_complete_winter_year()))
+        except Exception as e:
+            st.error(f"Could not scan the historical record ({e}). Pick another season or try again.")
+            st.stop()
+    if selected_season == AUTO_RAIN:
+        start_d, end_d = ext["rain_start"], ext["rain_end"]
+        st.sidebar.caption(
+            f"Rainiest of {ext['n_winters']} winters: {ext['rain_year'] - 1}-{str(ext['rain_year'])[2:]} "
+            f"({ext['rain_total_mm']:.0f} mm, ERA5 at 1,063 m)"
+        )
+    else:
+        start_d, end_d = ext["cold_start"], ext["cold_end"]
+        st.sidebar.caption(
+            f"Coldest 7-day spell: {start_d} to {end_d} "
+            f"(mean {ext['cold_mean_c']:.1f} °C, ERA5 at 1,063 m)"
+        )
 else:
     start_d, end_d = season_map[selected_season]
 
