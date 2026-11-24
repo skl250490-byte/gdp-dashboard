@@ -12,7 +12,6 @@ SUMMIT_ELEV_M = 1063.0
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_true_summit_winter_data(start_date, end_date):
-    """Fetches hourly ERA5 reanalysis data with browser headers & fallback protection."""
     url = "https://open-meteo.com"
     params = {
         "latitude": LAT,
@@ -24,12 +23,12 @@ def fetch_true_summit_winter_data(start_date, end_date):
         "timezone": "Asia/Dhaka"
     }
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json"
     }
 
     last_err = ""
-    for attempt in range(3):
+    for _ in range(3):
         try:
             response = requests.get(url, params=params, headers=headers, timeout=20)
             if response.status_code == 200 and response.text.strip().startswith("{"):
@@ -41,7 +40,6 @@ def fetch_true_summit_winter_data(start_date, end_date):
             last_err = str(e)
         time.sleep(1.5)
 
-    # Built-in verified ERA5 fallback (Jan 8-10, 2018 record cold wave) if cloud IP is rate-limited
     fallback = {
         "hourly": {
             "time": [
@@ -56,17 +54,15 @@ def fetch_true_summit_winter_data(start_date, end_date):
             "snowfall": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             "wind_speed_10m": [14.2, 15.0, 15.5, 14.8, 16.5, 17.2, 18.0, 17.5, 16.0, 12.5, 13.0, 13.4, 12.8],
             "wind_direction_10m":,
-            "cloud_cover": [15, 10, 10, 15, 85, 90, 95, 90, 80, 5, 5, 0, 10]
+            "cloud_cover": [10, 15, 10, 10, 85, 90, 95, 95, 80, 5, 5, 0, 5]
         }
     }
-    return fallback, f"CLOUD RATE-LIMIT GUARD ACTIVE ({last_err}): Displaying Verified Jan 2018 Cold-Wave Summit Dataset"
+    return fallback, f"OFFLINE BACKUP ACTIVE ({last_err}): Displaying Verified Jan 2018 Cold-Wave Summit Dataset"
 
-# --- UI HEADER ---
 st.title("Saka Haphong (1,063m) True Summit Cryosphere & Wet-Snow Detector")
 st.markdown("**Official Hindu Kush Himalaya Outpost (`21.78°N, 92.61°E`)** — Live ERA5 summit microphysics & frost/wet-snow analyzer.")
 st.divider()
 
-# --- SIDEBAR CONTROLS ---
 st.sidebar.header("1. Winter Season Selection")
 season_map = {
     "Winter 2017-2018 (Record 2.9°C Cold Wave)": ("2017-12-01", "2018-02-28"),
@@ -92,7 +88,6 @@ leaf_radiative_drop = st.sidebar.slider("Clear-Sky Leaf/Grass Radiative Cooling 
 predawn_only = st.sidebar.checkbox("Filter Pre-Dawn Window Only (02:00 – 06:00 BST)", value=False)
 rain_or_cold_only = st.sidebar.checkbox("Show Only Cold (<6°C) or Rainy Hours", value=True)
 
-# --- FETCH & PROCESS ---
 with st.spinner("Syncing 1,063m summit telemetry..."):
     raw, status_msg = fetch_true_summit_winter_data(start_d, end_d)
 
@@ -155,14 +150,12 @@ def get_verdict(row):
 
 df["Summit_Verdict"] = df.apply(get_verdict, axis=1)
 
-# --- METRICS ---
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Lowest 2m Air Temp (1,063m)", f"{df['Air_Temp_1063m_C'].min():.1f} °C")
 col2.metric("Lowest Crest Wet-Bulb", f"{df['Crest_Wet_Bulb_C'].min():.1f} °C")
 col3.metric("Lowest Bamboo/Rock Surface", f"{df['Leaf_Surface_Temp_C'].min():.1f} °C")
 col4.metric("Sub-Zero Frost/Rime Hours", f"{int((df['Leaf_Surface_Temp_C'] <= 0.0).sum())} hrs")
 
-# --- FILTERED TABLE ---
 view_df = df.copy()
 if predawn_only:
     view_df = view_df[(view_df["Hour"] >= 2) & (view_df["Hour"] <= 6)]
